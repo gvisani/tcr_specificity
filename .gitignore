@@ -12,5 +12,6 @@ imgt_prot_blast_db_*fasta
 *.err
 *.out
 *.npy
+*.npz
 *.pdb
 ncbi-blast-2.11.0+

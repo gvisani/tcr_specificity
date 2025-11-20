@@ -11,6 +11,11 @@ import os
 from typing import Optional, Union, Tuple, Dict, List
 from Bio.PDB import PDBParser
 
+PARSED_CHAINS_FILENAME = 'parsed_pdbs.jsonl'
+ASSIGNED_CHAINS_FILENAME = 'assigned_pdbs.jsonl'
+FIXED_POSITIONS_FILENAME = 'fixed_pdbs.jsonl'
+
+
 class ProteinMPNN(object):
 
     def __init__(
@@ -20,7 +25,115 @@ class ProteinMPNN(object):
         ) -> None:
         self.model_name = model_name
         self.proteinmpnn_path = proteinmpnn_path
+        
+    def prepare_inputs(
+            self,
+            output_dir: str,
+            pdbfile: Optional[str] = None, # either this or pdbdir can be specified
+            pdbdir: Optional[str] = None, # either this or pdbfile can be specified
+            chains_or_positions_to_design_or_score: Optional[Union[List[str], Dict[str, int]]] = None, # specifies positions to design, assuming only non-empty icodes are to be designed! if None, everything is designed
+            fix_pdbfile_offset: bool = True,
+        ) -> None:
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        ## initialize directory with pdbs
+        ## either a pdbdir is specified, in which case ProteinMPNN is run on all pdbfiles in it,
+        ##      or a single pdbfile is specified, in which case it is moved to a temporary directory within output_dir
+        assert pdbfile is not None or pdbdir is not None, "One of `pdbfile` or `pdbdir` must be specified."
+        assert not ((pdbfile is not None) and (pdbdir is not None)), "ONLY one of `pdbfile` and `pdbdir` can be specified, not both."
+
+        if pdbfile is not None:
+            # pdbfile case
+            # make temporary directory with the desired pdb
+            pdbdir_in_use = os.path.join(output_dir, "temp_pdbs")
+            if os.path.exists(pdbdir_in_use):
+                print(f"Warning: {pdbdir_in_use} already exists, deleting it...")
+                os.system(f'rm -r {pdbdir_in_use}')
+        
+            os.makedirs(pdbdir_in_use)
+            os.system(f'cp {pdbfile} {pdbdir_in_use}')
+
+            pdbfile_for_fix = pdbfile
+        
+        elif pdbdir is not None:
+            # pdbdir case
+            # assuming that the same offset fix applies to all pdb files in pdbdir (true for sure if structurres are the same just with different sequences)
+            #       just grabbing one representative pdbfile for the fix 
+            pdbdir_in_use = pdbdir
+            pdbfile_for_fix = os.path.join(pdbdir, os.listdir(pdbdir)[0])
+        
+        else:
+
+            raise ValueError(f"something has gone wrong")
+
+        path_for_parsed_chains = os.path.join(output_dir, PARSED_CHAINS_FILENAME)
+        os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/parse_multiple_chains.py")} --input_path={pdbdir_in_use} --output_path={path_for_parsed_chains}')
+
+        if chains_or_positions_to_design_or_score is not None:
+
+            if isinstance(chains_or_positions_to_design_or_score, list):
+                ## design specific chains
+
+                chains_str = " ".join(chains_or_positions_to_design_or_score)
+                path_for_assigned_chains = os.path.join(output_dir, ASSIGNED_CHAINS_FILENAME)
+            
+                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/assign_fixed_chains.py")} --input_path={path_for_parsed_chains} --output_path={path_for_assigned_chains} --chain_list "{chains_str}"')
+
+            elif isinstance(chains_or_positions_to_design_or_score, dict):
+                ## design specific positions on chains, assumig only empty icodes are being designed for now
+
+                chains_str, resnums_str = self._format_chain_and_resnums(chains_or_positions_to_design_or_score, fix_pdbfile_offset=fix_pdbfile_offset, pdbfile=pdbfile_for_fix)
+                path_for_assigned_chains = os.path.join(output_dir, ASSIGNED_CHAINS_FILENAME)
+                path_for_fixed_positions = os.path.join(output_dir, FIXED_POSITIONS_FILENAME)
+            
+                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/assign_fixed_chains.py")} --input_path={path_for_parsed_chains} --output_path={path_for_assigned_chains} --chain_list "{chains_str}"')
+                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/make_fixed_positions_dict.py")} --input_path={path_for_parsed_chains} --output_path={path_for_fixed_positions} --chain_list "{chains_str}" --position_list "{resnums_str}" --specify_non_fixed')
+            
+            else:
+                raise ValueError(f"Invalid type for `chains_or_positions_to_design_or_score`, must be None, list or dict, not {type(chains_or_positions_to_design_or_score)}.")
+
+    def run_on_prepared_inputs(
+            self,
+            output_dir: str,
+            specified_chains_to_design: bool = False, # either this or specified_fixed_positions can be specified
+            specified_fixed_positions: bool = False, # either this or specified_chains_to_design can be specified
+            conditional_probs_only: bool = False,
+            num_seq_per_target: int = 10,
+            sampling_temp: float = 0.1,
+            batch_size: int = 1,
+        ) -> None:
+
+        assert specified_chains_to_design or specified_fixed_positions, "One of `specified_chains_to_design` or `specified_fixed_positions` must be specified."
+        assert not (specified_chains_to_design and specified_fixed_positions), "ONLY one of `specified_chains_to_design` and `specified_fixed_positions` can be specified, not both."
+
+        path_for_parsed_chains = os.path.join(output_dir, PARSED_CHAINS_FILENAME)
+        path_for_assigned_chains = os.path.join(output_dir, ASSIGNED_CHAINS_FILENAME)
+        path_for_fixed_positions = os.path.join(output_dir, FIXED_POSITIONS_FILENAME)
+
+        proteinmpnn_arguments = [
+            f"--suppress_print 1",
+            f"--model_name {self.model_name}",
+            f"--jsonl_path {path_for_parsed_chains}",
+            f"--out_folder {output_dir}",
+            f"--num_seq_per_target {num_seq_per_target}",
+            f"--batch_size {batch_size}",
+            f"--sampling_temp {sampling_temp}",
+        ]
+
+        if conditional_probs_only:
+            proteinmpnn_arguments.append(f"--conditional_probs_only 1")
+        
+        if specified_chains_to_design:
+            proteinmpnn_arguments.append(f"--chain_id_jsonl {path_for_assigned_chains}")
+        elif specified_fixed_positions:
+            proteinmpnn_arguments.append(f"--chain_id_jsonl {path_for_assigned_chains}")
+            proteinmpnn_arguments.append(f"--fixed_positions_jsonl {path_for_fixed_positions}")
+        
+        final_command = f"python {os.path.join(self.proteinmpnn_path, f'protein_mpnn_run.py')} {' '.join(proteinmpnn_arguments)} "
+        os.system(final_command)
     
+
     def run(
             self,
             output_dir: str,
@@ -77,85 +190,31 @@ class ProteinMPNN(object):
         
         '''
 
-        ## initialize directory with pdbs
-        ## either a pdbdir is specified, in which case ProteinMPNN is run on all pdbfiles in it,
-        ##      or a single pdbfile is specified, in which case it is moved to a temporary directory within output_dir
-        assert pdbfile is not None or pdbdir is not None, "One of `pdbfile` or `pdbdir` must be specified."
-        assert not ((pdbfile is not None) and (pdbdir is not None)), "ONLY one of `pdbfile` and `pdbdir` can be specified, not both."
+        self.prepare_inputs(
+            output_dir,
+            pdbfile=pdbfile,
+            pdbdir=pdbdir,
+            chains_or_positions_to_design_or_score=chains_or_positions_to_design_or_score,
+            fix_pdbfile_offset=fix_pdbfile_offset
+        )
 
-        if pdbfile is not None:
-            # pdbfile case
-            # make temporary directory with the desired pdb
-            pdbdir_in_use = os.path.join(output_dir, "temp_pdbs")
-            if os.path.exists(pdbdir_in_use):
-                print(f"Warning: {pdbdir_in_use} already exists, deleting it...")
-                os.system(f'rm -r {pdbdir_in_use}')
+        ## same logic as in prepare_inputs() 
+        specified_chains_to_design = False
+        specified_fixed_positions = False
+        if isinstance(chains_or_positions_to_design_or_score, list):
+            specified_chains_to_design = True
+        elif isinstance(chains_or_positions_to_design_or_score, dict):
+            specified_fixed_positions = True
         
-            os.makedirs(pdbdir_in_use)
-            os.system(f'cp {pdbfile} {pdbdir_in_use}')
-
-            pdbfile_for_fix = pdbfile
-        
-        elif pdbdir is not None:
-            # pdbdir case
-            # assuming that the same offset fix applies to all pdb files in pdbdir (true for sure if structurres are the same just with different sequences)
-            #       just grabbing one representative pdbfile for the fix 
-            pdbdir_in_use = pdbdir
-            pdbfile_for_fix = os.path.join(pdbdir, os.listdir(pdbdir)[0])
-
-        path_for_parsed_chains = os.path.join(output_dir, 'parsed_pdbs.jsonl')
-        os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/parse_multiple_chains.py")} --input_path={pdbdir_in_use} --output_path={path_for_parsed_chains}')
-
-        proteinmpnn_arguments = [
-            f"--suppress_print 1",
-            f"--model_name {self.model_name}",
-            f"--jsonl_path {path_for_parsed_chains}",
-            f"--out_folder {output_dir}",
-            f"--num_seq_per_target {num_seq_per_target}",
-            f"--batch_size {batch_size}",
-            f"--sampling_temp {sampling_temp}",
-        ]
-
-        if conditional_probs_only:
-            proteinmpnn_arguments.append(f"--conditional_probs_only 1")
-
-        if chains_or_positions_to_design_or_score is not None:
-
-            if isinstance(chains_or_positions_to_design_or_score, list):
-                ## design specific chains
-
-                chains_str = " ".join(chains_or_positions_to_design_or_score)
-                path_for_assigned_chains = os.path.join(output_dir, 'assigned_pdbs.jsonl')
-            
-                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/assign_fixed_chains.py")} --input_path={path_for_parsed_chains} --output_path={path_for_assigned_chains} --chain_list "{chains_str}"')
-
-                proteinmpnn_arguments.append(f"--chain_id_jsonl {path_for_assigned_chains}")
-
-            elif isinstance(chains_or_positions_to_design_or_score, dict):
-                ## design specific positions on chains, assumig only empty icodes are being designed for now
-
-                chains_str, resnums_str = self._format_chain_and_resnums(chains_or_positions_to_design_or_score, fix_pdbfile_offset=fix_pdbfile_offset, pdbfile=pdbfile_for_fix)
-                print()
-                print(chains_str)
-                print(resnums_str)
-                print()
-                path_for_assigned_chains = os.path.join(output_dir, 'assigned_pdbs.jsonl')
-                path_for_fixed_positions = os.path.join(output_dir, 'fixed_pdbs.jsonl')
-            
-                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/assign_fixed_chains.py")} --input_path={path_for_parsed_chains} --output_path={path_for_assigned_chains} --chain_list "{chains_str}"')
-                os.system(f'python {os.path.join(self.proteinmpnn_path, f"helper_scripts/make_fixed_positions_dict.py")} --input_path={path_for_parsed_chains} --output_path={path_for_fixed_positions} --chain_list "{chains_str}" --position_list "{resnums_str}" --specify_non_fixed')
-
-                proteinmpnn_arguments.append(f"--chain_id_jsonl {path_for_assigned_chains}")
-                proteinmpnn_arguments.append(f"--fixed_positions_jsonl {path_for_fixed_positions}")
-            
-            else:
-                raise ValueError(f"Invalid type for `chains_or_positions_to_design_or_score`, must be None, list or dict, not {type(chains_or_positions_to_design_or_score)}.")
-        
-        final_command = f"python {os.path.join(self.proteinmpnn_path, f'protein_mpnn_run.py')} {' '.join(proteinmpnn_arguments)} "
-        print()
-        print(final_command)
-        print()
-        os.system(final_command)
+        self.run_on_prepared_inputs(
+            output_dir,
+            specified_chains_to_design=specified_chains_to_design,
+            specified_fixed_positions=specified_fixed_positions,
+            conditional_probs_only=conditional_probs_only,
+            num_seq_per_target=num_seq_per_target,
+            sampling_temp=sampling_temp,
+            batch_size=batch_size,
+        )
 
 
     def _format_chain_and_resnums(
